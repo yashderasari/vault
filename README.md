@@ -13,11 +13,11 @@ Most MCP file tools require you to know and type exact paths. Vault's `find_fold
 ### 1. Install
 
 ```bash
-git clone https://github.com/yashderasari/vault.git
-cd vault
-pip install .
-# or with uv (recommended)
-uv sync
+# Zero-install (recommended) — runs directly from PyPI
+uvx ai-vault-mcp
+
+# Or install permanently
+pip install ai-vault-mcp
 ```
 
 ### 2. Add to your MCP client
@@ -28,8 +28,8 @@ uv sync
 {
   "mcpServers": {
     "vault": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/vault", "python", "server.py"]
+      "command": "uvx",
+      "args": ["ai-vault-mcp"]
     }
   }
 }
@@ -37,12 +37,12 @@ uv sync
 
 **Claude Code:**
 ```bash
-claude mcp add vault -- uv run --directory /path/to/vault python server.py
+claude mcp add vault -- uvx ai-vault-mcp
 ```
 
-**HTTP mode** (for remote clients):
+**HTTP mode** (for remote clients or Docker):
 ```bash
-uv run python server.py --transport http --host 0.0.0.0 --port 8000
+uvx ai-vault-mcp --transport http --host 0.0.0.0 --port 8000
 ```
 
 ### 3. First-run setup
@@ -51,7 +51,7 @@ The first time you ask Claude to do anything with files, it'll say:
 
 > *"Where would you like to save your files? You can point me to an existing folder (e.g. ~/Documents) or I can create a fresh ~/Documents/Vault folder just for AI-generated files."*
 
-Answer in plain English. Claude calls `configure` under the hood, saves your choice to `~/.vault-mcp/config.json`, and never asks again.
+Answer in plain English. Claude calls `configure` under the hood, saves your choice to `~/.ai-vault-mcp/config.json`, and never asks again.
 
 ---
 
@@ -83,8 +83,9 @@ Answer in plain English. Claude calls `configure` under the hood, saves your cho
 | `MCP_FILE_SERVER_MAX_SIZE_MB` | `500` | Max download size in MB |
 | `MCP_FILE_SERVER_ALLOWED_ROOTS` | *(from config file)* | Override allowed roots (colon-separated paths) |
 | `MCP_FILE_SERVER_BASE_DIR` | *(from config file)* | Override default save location |
+| `PORT` | `8000` | Port for HTTP transport (read automatically in cloud environments) |
 
-Env vars take priority over `~/.vault-mcp/config.json`.
+Env vars take priority over `~/.ai-vault-mcp/config.json`.
 
 ---
 
@@ -106,17 +107,22 @@ Env vars take priority over `~/.vault-mcp/config.json`.
 docker build -t vault .
 docker run -p 8000:8000 \
   -e VAULT_RATE_LIMIT_PER_MINUTE=30 \
-  -v ~/.vault-mcp:/home/vault/.vault-mcp \
+  -v ~/.ai-vault-mcp:/home/vault/.ai-vault-mcp \
   vault
 ```
 
-Point your MCP client to `http://localhost:8000/mcp`.
+Point your MCP client to `http://localhost:8000/mcp`. Health check: `GET http://localhost:8000/health`.
 
 ---
 
 ## Development
 
 ```bash
+# Clone and set up
+git clone https://github.com/yashderasari/vault.git
+cd vault
+uv sync
+
 # Run tests
 uv run pytest tests/ -v
 

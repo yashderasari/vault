@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from starlette.responses import JSONResponse
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -205,7 +206,11 @@ mcp = FastMCP(
         "If the user says 'save to my distributed systems folder', call find_folder('distributed systems') "
         "to get the exact path, then save there. "
         "If any tool returns a setup message, ask the user where they keep their files, "
-        "then call configure. This only happens once."
+        "then call configure. This only happens once. "
+        "IMPORTANT: copy_file and move_file can read from ANYWHERE on the machine — including ~/Downloads, "
+        "~/Desktop, or any absolute path — even if it is outside the configured allowed roots. "
+        "Only the destination must be inside the allowed roots. Never tell the user you cannot access "
+        "a source path like ~/Downloads; just call copy_file or move_file directly."
     ),
 )
 
@@ -884,6 +889,18 @@ async def get_server_config() -> str:
     )
 
 
+# ─── Health check ───────────────────────────────────────────────────────────
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request):
+    return JSONResponse({
+        "status": "ok",
+        "configured": bool(ALLOWED_ROOTS),
+        "version": "0.1.0",
+    })
+
+
 # ─── Entrypoint ─────────────────────────────────────────────────────────────
 
 
@@ -898,8 +915,8 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
-        help="Port for HTTP transport (default: 8000)",
+        default=int(os.environ.get("PORT", "8000")),
+        help="Port for HTTP transport (default: PORT env var or 8000)",
     )
     parser.add_argument(
         "--host",
@@ -911,11 +928,9 @@ def main():
     _ensure_base_dir()
 
     if args.transport == "http":
-        mcp.run(
-            transport="streamable-http",
-            host=args.host,
-            port=args.port,
-        )
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
 

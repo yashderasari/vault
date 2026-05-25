@@ -1,17 +1,32 @@
 [project]
-name = "mcp-file-server"
+name = "ai-vault-mcp"
 version = "0.1.0"
-description = "MCP server for downloading, saving, and managing local files from any AI client"
+description = "MCP server that gives AI clients direct access to your local filesystem — save, find, and organize files using natural language"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.11"
+authors = [{ name = "Yash Derasari", email = "ydmisc2803@gmail.com" }]
+keywords = ["mcp", "claude", "filesystem", "ai-tools", "model-context-protocol"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Utilities",
+    "Topic :: System :: Filesystems",
+]
 dependencies = [
     "mcp[cli]>=1.27",
     "httpx>=0.27",
 ]
 
+[project.urls]
+Homepage = "https://github.com/yashderasari/vault"
+Repository = "https://github.com/yashderasari/vault"
+Issues = "https://github.com/yashderasari/vault/issues"
+
 [project.scripts]
-mcp-file-server = "server:main"
+ai-vault-mcp = "server:main"
 
 [project.optional-dependencies]
 dev = [
