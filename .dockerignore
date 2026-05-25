@@ -1,0 +1,9 @@
+.git
+.DS_Store
+__pycache__
+*.egg-info
+.venv
+tests/
+*.pyc
+.env
+uv.lock

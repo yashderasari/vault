@@ -11,12 +11,16 @@ Usage:
 
 import os
 import re
+import sys
 import json
+import time
 import shutil
+import logging
 import mimetypes
 import hashlib
 import argparse
 import base64
+from collections import defaultdict, deque
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -32,6 +36,8 @@ CONFIG_PATH = Path.home() / ".vault-mcp" / "config.json"
 MAX_FILE_SIZE_MB = int(os.environ.get("MCP_FILE_SERVER_MAX_SIZE_MB", "500"))
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
+RATE_LIMIT = int(os.environ.get("VAULT_RATE_LIMIT_PER_MINUTE", "60"))
+
 # Blocked file extensions (security)
 BLOCKED_EXTENSIONS = {
     ".exe", ".bat", ".cmd", ".com", ".scr", ".pif",
@@ -39,6 +45,35 @@ BLOCKED_EXTENSIONS = {
     ".msi", ".msp", ".ps1", ".psm1",
 }
 
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=os.environ.get("VAULT_LOG_LEVEL", "INFO"),
+    stream=sys.stderr,
+    format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":%(message)s}',
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("vault")
+
+# ─── Rate limiting ───────────────────────────────────────────────────────────
+
+_call_history: dict[str, deque] = defaultdict(deque)
+
+
+def _check_rate_limit(tool_name: str):
+    now = time.time()
+    history = _call_history[tool_name]
+    while history and history[0] < now - 60:
+        history.popleft()
+    if len(history) >= RATE_LIMIT:
+        raise ValueError(
+            f"Rate limit exceeded for '{tool_name}': max {RATE_LIMIT} calls/min. Try again shortly."
+        )
+    history.append(now)
+
+
+# ─── Config persistence ──────────────────────────────────────────────────────
 
 def _load_config() -> dict:
     """Load persisted config from ~/.vault-mcp/config.json."""
@@ -181,17 +216,23 @@ mcp = FastMCP(
 @mcp.tool()
 async def download_file(
     url: str,
+    directory: str,
     filename: Optional[str] = None,
-    subfolder: Optional[str] = None,
 ) -> str:
     """
     Download a file from a URL and save it to a local folder.
+    Always use a full absolute path for the directory.
 
     Args:
         url: The URL to download from (http/https).
+        directory: Full absolute path of the folder to save into (e.g. "/Users/you/Documents/Papers").
         filename: Optional filename override. If omitted, inferred from the URL.
-        subfolder: Optional subfolder inside the base directory (e.g. "projects/web").
     """
+    try:
+        _check_rate_limit("download_file")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"downloading %s"', url)
     _ensure_base_dir()
 
     # Validate URL
@@ -203,15 +244,14 @@ async def download_file(
     if not filename:
         url_path = parsed.path.rstrip("/")
         filename = os.path.basename(url_path) or "downloaded_file"
-        # Strip query params from filename
         filename = re.sub(r"[?#].*", "", filename)
 
     _check_extension(filename)
 
-    # Build target path
-    target_dir = DEFAULT_BASE_DIR
-    if subfolder:
-        target_dir = str(_resolve_path(subfolder))
+    try:
+        target_dir = str(_resolve_path(directory))
+    except ValueError as e:
+        return f"❌ {e}"
     os.makedirs(target_dir, exist_ok=True)
 
     target_path = _resolve_path(os.path.join(target_dir, filename))
@@ -291,6 +331,11 @@ async def save_content(
         filepath: Full absolute path for the file (e.g. "/Users/yashderasari/Documents/Jobs/coverletter.md").
         encoding: File encoding (default: utf-8).
     """
+    try:
+        _check_rate_limit("save_content")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"saving content to %s"', filepath)
     _ensure_base_dir()
 
     path = Path(filepath).expanduser()
@@ -335,27 +380,36 @@ async def save_content(
 @mcp.tool()
 async def save_binary(
     content_base64: str,
-    filename: str,
-    subfolder: Optional[str] = None,
+    filepath: str,
 ) -> str:
     """
     Save binary content (e.g. a PDF, image, zip) to a local file.
     Pass the file bytes as a base64-encoded string.
+    Always use a full absolute path.
 
     Args:
         content_base64: Base64-encoded binary content.
-        filename: Name for the file (e.g. "report.pdf", "photo.png").
-        subfolder: Optional subfolder inside the base directory.
+        filepath: Full absolute path for the file (e.g. "/Users/you/Documents/report.pdf").
     """
+    try:
+        _check_rate_limit("save_binary")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"saving binary to %s"', filepath)
     _ensure_base_dir()
-    _check_extension(filename)
 
-    target_dir = DEFAULT_BASE_DIR
-    if subfolder:
-        target_dir = str(_resolve_path(subfolder))
-    os.makedirs(target_dir, exist_ok=True)
+    path = Path(filepath).expanduser()
+    if not path.is_absolute():
+        path = Path(DEFAULT_BASE_DIR) / path
 
-    target_path = _resolve_path(os.path.join(target_dir, filename))
+    _check_extension(path.name)
+
+    try:
+        target_path = _resolve_path(str(path))
+    except ValueError as e:
+        return f"❌ {e}"
+
+    os.makedirs(target_path.parent, exist_ok=True)
 
     if target_path.exists():
         return (
@@ -407,6 +461,11 @@ async def list_files(
         pattern: Optional glob pattern to filter (e.g. "*.pdf", "*.py").
         recursive: If True, list files recursively. Keep False for large directories.
     """
+    try:
+        _check_rate_limit("list_files")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"listing %s"', directory or "~/Documents")
     _ensure_base_dir()
 
     if directory:
@@ -436,26 +495,26 @@ async def list_files(
     if not items:
         return f"📁 Empty directory: {target}"
 
-    lines = [f"📁 Listing: {target}\n"]
-    dirs = [i for i in items if i.is_dir()]
-    files = [i for i in items if i.is_file()]
-
-    for d in dirs:
-        rel = d.relative_to(target)
-        lines.append(f"  📂 {rel}/")
-
-    for f in files:
-        rel = f.relative_to(target)
-        size = _human_size(f.stat().st_size)
-        lines.append(f"  📄 {rel}  ({size})")
-
     MAX_ENTRIES = 200
-    total = len(dirs) + len(files)
-    dirs = dirs[:MAX_ENTRIES]
-    files = files[:max(0, MAX_ENTRIES - len(dirs))]
+    all_dirs = [i for i in items if i.is_dir()]
+    all_files = [i for i in items if i.is_file()]
+    total = len(all_dirs) + len(all_files)
     truncated = total > MAX_ENTRIES
 
-    lines.append(f"\n  {len(dirs)} folder(s), {len(files)} file(s)" + (f" (truncated — {total} total, use a subdirectory path to narrow down)" if truncated else ""))
+    shown_dirs = all_dirs[:MAX_ENTRIES]
+    shown_files = all_files[:max(0, MAX_ENTRIES - len(shown_dirs))]
+
+    lines = [f"📁 Listing: {target}\n"]
+    for d in shown_dirs:
+        lines.append(f"  📂 {d.relative_to(target)}/")
+    for f in shown_files:
+        size = _human_size(f.stat().st_size)
+        lines.append(f"  📄 {f.relative_to(target)}  ({size})")
+
+    summary = f"\n  {len(shown_dirs)} folder(s), {len(shown_files)} file(s)"
+    if truncated:
+        summary += f" (truncated — {total} total, narrow down with a subdirectory path)"
+    lines.append(summary)
     return "\n".join(lines)
 
 
@@ -463,24 +522,29 @@ async def list_files(
 
 
 @mcp.tool()
-async def create_directory(
-    name: str,
-    subfolder: Optional[str] = None,
-) -> str:
+async def create_directory(path: str) -> str:
     """
-    Create a new directory inside the managed file area.
+    Create a new directory at the given path.
+    Always use a full absolute path.
 
     Args:
-        name: Name of the directory to create (e.g. "projects/new-app").
-        subfolder: Optional parent subfolder.
+        path: Full absolute path of the directory to create (e.g. "/Users/you/Documents/Projects/new-app").
     """
+    try:
+        _check_rate_limit("create_directory")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"creating directory %s"', path)
     _ensure_base_dir()
 
-    base = DEFAULT_BASE_DIR
-    if subfolder:
-        base = str(_resolve_path(subfolder))
+    target_path = Path(path).expanduser()
+    if not target_path.is_absolute():
+        target_path = Path(DEFAULT_BASE_DIR) / target_path
 
-    target = _resolve_path(os.path.join(base, name))
+    try:
+        target = _resolve_path(str(target_path))
+    except ValueError as e:
+        return f"❌ {e}"
 
     try:
         os.makedirs(target, exist_ok=True)
@@ -500,6 +564,11 @@ async def get_file_info(filepath: str) -> str:
     Args:
         filepath: Path to the file (relative to base dir, or absolute within allowed roots).
     """
+    try:
+        _check_rate_limit("get_file_info")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"getting info for %s"', filepath)
     try:
         target = _resolve_path(filepath)
     except ValueError as e:
@@ -531,14 +600,20 @@ async def get_file_info(filepath: str) -> str:
 @mcp.tool()
 async def move_file(source: str, destination: str) -> str:
     """
-    Move or rename a file within the managed file area.
+    Move or rename a file. Source can be anywhere on the machine.
+    Destination must be within an allowed root.
 
     Args:
-        source: Current path of the file.
-        destination: New path (can be a directory or full filename).
+        source: Absolute path to the source file (anywhere on this machine).
+        destination: Destination path within the managed area (directory or full filepath).
     """
     try:
-        src = _resolve_path(source)
+        _check_rate_limit("move_file")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"moving %s to %s"', source, destination)
+    src = Path(source).expanduser().resolve()
+    try:
         dst = _resolve_path(destination)
     except ValueError as e:
         return f"❌ {e}"
@@ -581,6 +656,11 @@ async def copy_file(source: str, destination: str) -> str:
         source: Absolute path to the source file (anywhere on this machine).
         destination: Destination path within the managed area (directory or full filepath).
     """
+    try:
+        _check_rate_limit("copy_file")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"copying %s to %s"', source, destination)
     src = Path(source).expanduser().resolve()
     try:
         dst = _resolve_path(destination)
@@ -633,6 +713,11 @@ async def read_file(
         encoding: File encoding (default: utf-8).
     """
     try:
+        _check_rate_limit("read_file")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"reading %s"', filepath)
+    try:
         target = _resolve_path(filepath)
     except ValueError as e:
         return f"❌ {e}"
@@ -684,6 +769,7 @@ async def configure(
                        (e.g. ["/Users/alice/Documents"]).
         base_dir: Default folder for saving new files. Defaults to allowed_roots[0].
     """
+    logger.info('"configuring vault with roots %s"', allowed_roots)
     global ALLOWED_ROOTS, DEFAULT_BASE_DIR
 
     resolved_roots = []
@@ -745,6 +831,11 @@ async def find_folder(name: str) -> str:
     Args:
         name: Folder name or partial name to search for (case-insensitive).
     """
+    try:
+        _check_rate_limit("find_folder")
+    except ValueError as e:
+        return f"❌ {e}"
+    logger.info('"searching for folder %s"', name)
     if not ALLOWED_ROOTS:
         return SETUP_REQUIRED_MSG
 

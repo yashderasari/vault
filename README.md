@@ -1,148 +1,137 @@
 # Vault — MCP File Server
 
-An MCP (Model Context Protocol) server that lets any AI client — Claude Desktop, ChatGPT, Claude Code, etc. — download files, save content, and manage folders on your local machine.
+An MCP (Model Context Protocol) server that gives any AI client — Claude Desktop, Claude Code, ChatGPT, etc. — direct access to your local filesystem. Save AI-generated content, copy files between folders, download from URLs, and organize your machine using natural language.
 
-## Features
+## What makes it different
 
-| Tool | Description |
-|---|---|
-| `download_file` | Download from any URL to a local folder |
-| `save_content` | Save AI-generated text/code/markdown to a **new** file |
-| `list_files` | Browse directories with glob patterns |
-| `create_directory` | Create new folders |
-| `get_file_info` | File metadata, size, hash, MIME type |
-| `copy_file` | Copy a file to a new location |
-| `move_file` | Move or rename files |
-| `read_file` | Read text file contents |
-| `get_server_config` | Show current server settings |
+Most MCP file tools require you to know and type exact paths. Vault's `find_folder` tool lets you say *"save this to my distributed systems folder"* and Claude finds the right path itself — no copy-paste required.
 
-## Security & Guardrails
+---
 
-- **Sandboxed** — writes are restricted to allowed root directories (default: `~/Downloads/mcp-files`)
-- **Path traversal protection** — all paths are resolved and validated
-- **Blocked extensions** — `.exe`, `.bat`, `.ps1`, etc. are blocked by default
-- **Size limits** — configurable max download size (default: 500 MB)
-- **No in-place edits** — `save_content` refuses to write if the target file already exists; always save under a new filename
-- **No silent overwrites on move** — `move_file` refuses if the destination already exists
-- **No delete** — `delete_file` has been removed; file deletion must be done manually
-
-## Quick Start
+## Quickstart
 
 ### 1. Install
 
 ```bash
-# Clone or copy the project
-cd mcp-file-server
-
-# Install with uv (recommended)
+git clone https://github.com/yashderasari/vault.git
+cd vault
+pip install .
+# or with uv (recommended)
 uv sync
-
-# Or with pip
-pip install -e .
 ```
 
-### 2. Run
+### 2. Add to your MCP client
 
-**stdio mode** (for Claude Desktop, Claude Code):
-```bash
-uv run python server.py
-# or
-python server.py
-```
-
-**HTTP mode** (for remote/web clients):
-```bash
-uv run python server.py --transport http --port 8000
-# Server will be available at http://127.0.0.1:8000/mcp
-```
-
-## Client Setup
-
-### Claude Desktop (`claude_desktop_config.json`)
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on Mac):
 
 ```json
 {
   "mcpServers": {
-    "file-server": {
+    "vault": {
       "command": "uv",
-      "args": [
-        "run",
-        "--directory", "/absolute/path/to/mcp-file-server",
-        "python", "server.py"
-      ]
+      "args": ["run", "--directory", "/path/to/vault", "python", "server.py"]
     }
   }
 }
 ```
 
-**Config file location:**
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-### Claude Code
-
+**Claude Code:**
 ```bash
-claude mcp add file-server -- uv run --directory /path/to/mcp-file-server python server.py
+claude mcp add vault -- uv run --directory /path/to/vault python server.py
 ```
 
-Or for HTTP transport:
+**HTTP mode** (for remote clients):
 ```bash
-# Start the server first
-uv run python server.py --transport http --port 8000
-
-# Then add in Claude Code
-claude mcp add --transport http file-server http://127.0.0.1:8000/mcp
+uv run python server.py --transport http --host 0.0.0.0 --port 8000
 ```
 
-### ChatGPT / Other MCP Clients (HTTP mode)
+### 3. First-run setup
 
-Start the server in HTTP mode and point your client to:
-```
-http://127.0.0.1:8000/mcp
-```
+The first time you ask Claude to do anything with files, it'll say:
+
+> *"Where would you like to save your files? You can point me to an existing folder (e.g. ~/Documents) or I can create a fresh ~/Documents/Vault folder just for AI-generated files."*
+
+Answer in plain English. Claude calls `configure` under the hood, saves your choice to `~/.vault-mcp/config.json`, and never asks again.
+
+---
+
+## Tool reference
+
+| Tool | What it does |
+|---|---|
+| `configure` | First-run setup — sets allowed roots and default save location |
+| `find_folder` | Find a folder by name without knowing the exact path |
+| `save_content` | Save text, markdown, or code to a file |
+| `save_binary` | Save base64-encoded binary content (images, zips) |
+| `download_file` | Download any URL to a local folder |
+| `copy_file` | Copy a file from anywhere on the machine into your vault |
+| `move_file` | Move or rename a file |
+| `list_files` | Browse a directory (with optional glob filter) |
+| `create_directory` | Create a new folder |
+| `read_file` | Read a text file's contents |
+| `get_file_info` | File metadata: size, hash, MIME type, timestamps |
+| `get_server_config` | Show current configuration |
+
+---
 
 ## Configuration
 
-All config is via environment variables:
-
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_FILE_SERVER_BASE_DIR` | `~/Downloads/mcp-files` | Default save location |
+| `VAULT_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `VAULT_RATE_LIMIT_PER_MINUTE` | `60` | Max tool calls per tool per minute |
 | `MCP_FILE_SERVER_MAX_SIZE_MB` | `500` | Max download size in MB |
-| `MCP_FILE_SERVER_ALLOWED_ROOTS` | Same as base dir | Colon-separated list of allowed directories |
+| `MCP_FILE_SERVER_ALLOWED_ROOTS` | *(from config file)* | Override allowed roots (colon-separated paths) |
+| `MCP_FILE_SERVER_BASE_DIR` | *(from config file)* | Override default save location |
 
-### Example: Allow multiple directories
+Env vars take priority over `~/.vault-mcp/config.json`.
+
+---
+
+## Security model
+
+- **Sandboxed writes** — all file operations are restricted to paths within your configured allowed roots
+- **Path traversal protection** — every path is resolved and validated before use; `../` escapes are blocked
+- **Blocked extensions** — `.exe`, `.bat`, `.ps1`, `.cmd`, `.msi`, `.js`, and other dangerous types are always rejected
+- **No silent overwrites** — `save_content` and `copy_file` refuse to overwrite existing files
+- **No delete tool** — file deletion must be done manually; Claude cannot delete files
+- **Rate limiting** — configurable per-tool call rate limit prevents runaway loops
+- **Unrestricted source reads** — `copy_file` and `move_file` can read from anywhere on the machine; only the destination is sandboxed
+
+---
+
+## Docker
 
 ```bash
-export MCP_FILE_SERVER_BASE_DIR=~/Downloads/mcp-files
-export MCP_FILE_SERVER_ALLOWED_ROOTS="$HOME/Downloads/mcp-files:$HOME/Documents/ai-output:$HOME/Projects"
-python server.py
+docker build -t vault .
+docker run -p 8000:8000 \
+  -e VAULT_RATE_LIMIT_PER_MINUTE=30 \
+  -v ~/.vault-mcp:/home/vault/.vault-mcp \
+  vault
 ```
 
-## Usage Examples
+Point your MCP client to `http://localhost:8000/mcp`.
 
-Once connected, just ask your AI naturally:
-
-> "Download this PDF: https://example.com/report.pdf"
-
-> "Save this Python script as `sort.py` in the `scripts` folder"
-
-> "List all markdown files in my projects folder"
-
-> "What files do I have saved?"
-
-> "Move report.pdf to the archive folder"
+---
 
 ## Development
 
 ```bash
-# Run in dev mode with the MCP Inspector
-uv run mcp dev server.py
+# Run tests
+uv run pytest tests/ -v
 
-# Test with Inspector UI
-npx -y @modelcontextprotocol/inspector
-# Connect to http://localhost:8000/mcp
+# Inspect logs (logs go to stderr)
+uv run python server.py 2>vault.log
+
+# MCP Inspector
+uv run mcp dev server.py
 ```
+
+### Trust
+
+This server can be submitted to the [MCP Trust Framework](https://nimblebrain.ai) for an independent security assessment once you're ready to ship publicly.
+
+---
 
 ## License
 
