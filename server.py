@@ -10,13 +10,11 @@ Usage:
 """
 
 import os
-import sys
 import re
 import json
 import shutil
 import mimetypes
 import hashlib
-import asyncio
 import argparse
 import base64
 from pathlib import Path
@@ -29,23 +27,10 @@ from mcp.server.fastmcp import FastMCP
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
-DEFAULT_BASE_DIR = os.environ.get(
-    "MCP_FILE_SERVER_BASE_DIR",
-    os.path.expanduser("~/Downloads/mcp-files"),
-)
+CONFIG_PATH = Path.home() / ".vault-mcp" / "config.json"
 
 MAX_FILE_SIZE_MB = int(os.environ.get("MCP_FILE_SERVER_MAX_SIZE_MB", "500"))
-MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024  # bytes
-
-
-# Directories the server is allowed to write into (sandboxing)
-ALLOWED_ROOTS: list[str] = [
-    os.path.normpath(os.path.expanduser(p))
-    for p in os.environ.get(
-        "MCP_FILE_SERVER_ALLOWED_ROOTS",
-        DEFAULT_BASE_DIR,
-    ).split(os.pathsep)
-]
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # Blocked file extensions (security)
 BLOCKED_EXTENSIONS = {
@@ -54,27 +39,85 @@ BLOCKED_EXTENSIONS = {
     ".msi", ".msp", ".ps1", ".psm1",
 }
 
+
+def _load_config() -> dict:
+    """Load persisted config from ~/.vault-mcp/config.json."""
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_config(data: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(data, indent=2))
+
+
+def _init_roots() -> tuple[list[str], str]:
+    """
+    Resolve ALLOWED_ROOTS and DEFAULT_BASE_DIR from (in priority order):
+      1. Environment variables
+      2. ~/.vault-mcp/config.json
+      3. Unconfigured (empty) — triggers setup flow
+    """
+    # Env vars take priority
+    if os.environ.get("MCP_FILE_SERVER_ALLOWED_ROOTS"):
+        roots = [
+            os.path.normpath(os.path.expanduser(p))
+            for p in os.environ["MCP_FILE_SERVER_ALLOWED_ROOTS"].split(os.pathsep)
+        ]
+        base = os.path.normpath(os.path.expanduser(
+            os.environ.get("MCP_FILE_SERVER_BASE_DIR", roots[0])
+        ))
+        return roots, base
+
+    cfg = _load_config()
+    if cfg.get("allowed_roots"):
+        roots = [os.path.normpath(os.path.expanduser(p)) for p in cfg["allowed_roots"]]
+        base = os.path.normpath(os.path.expanduser(cfg.get("base_dir", roots[0])))
+        return roots, base
+
+    return [], ""  # unconfigured
+
+
+ALLOWED_ROOTS, DEFAULT_BASE_DIR = _init_roots()
+
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 
+SETUP_REQUIRED_MSG = (
+    "⚠️ Vault isn't set up yet.\n\n"
+    "Before I can save or manage any files, I need to know where you keep your stuff. "
+    "Please ask the user:\n\n"
+    "\"Where would you like to save your files? You can:\n"
+    "  1. Point me to an existing folder (e.g. ~/Documents or ~/Desktop)\n"
+    "  2. Create a fresh ~/Documents/Vault folder just for AI-generated files\"\n\n"
+    "Once they answer, call the configure tool with their choice."
+)
+
+
 def _ensure_base_dir():
-    """Create the default base directory if it doesn't exist."""
-    os.makedirs(DEFAULT_BASE_DIR, exist_ok=True)
+    if DEFAULT_BASE_DIR:
+        os.makedirs(DEFAULT_BASE_DIR, exist_ok=True)
 
 
 def _resolve_path(target: str) -> Path:
     """
     Resolve a user-supplied path, ensuring it stays within ALLOWED_ROOTS.
-    Raises ValueError on path-traversal attempts.
+    Raises ValueError on path-traversal attempts or unconfigured state.
     """
-    # If relative, anchor to DEFAULT_BASE_DIR
+    if not ALLOWED_ROOTS:
+        raise ValueError(SETUP_REQUIRED_MSG)
+
     if not os.path.isabs(target):
         target = os.path.join(DEFAULT_BASE_DIR, target)
 
     resolved = Path(target).resolve()
 
     for root in ALLOWED_ROOTS:
-        if str(resolved).startswith(root):
+        if str(resolved) == root or str(resolved).startswith(root + os.sep):
             return resolved
 
     raise ValueError(
@@ -122,8 +165,12 @@ def _file_info(path: Path) -> dict:
 mcp = FastMCP(
     "Vault",
     instructions=(
-        "Download files from URLs, save AI-generated content, "
-        "and manage files/folders on your local machine."
+        "You are a file management assistant with access to the user's local machine. "
+        "CRITICAL: Never ask the user for a file path — use find_folder to locate folders by name instead. "
+        "If the user says 'save to my distributed systems folder', call find_folder('distributed systems') "
+        "to get the exact path, then save there. "
+        "If any tool returns a setup message, ask the user where they keep their files, "
+        "then call configure. This only happens once."
     ),
 )
 
@@ -619,20 +666,130 @@ async def read_file(
         return f"❌ Read failed: {e}"
 
 
+# ── Tool: configure ───────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def configure(
+    allowed_roots: list[str],
+    base_dir: Optional[str] = None,
+) -> str:
+    """
+    Set up the vault for this user. Call this once after asking the user where
+    they keep their files. Persists to ~/.vault-mcp/config.json and takes
+    effect immediately — no restart needed.
+
+    Args:
+        allowed_roots: List of absolute folder paths the vault can read/write
+                       (e.g. ["/Users/alice/Documents"]).
+        base_dir: Default folder for saving new files. Defaults to allowed_roots[0].
+    """
+    global ALLOWED_ROOTS, DEFAULT_BASE_DIR
+
+    resolved_roots = []
+    for p in allowed_roots:
+        path = Path(p).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        resolved_roots.append(str(path))
+
+    resolved_base = str(
+        Path(base_dir).expanduser().resolve() if base_dir else Path(resolved_roots[0])
+    )
+    Path(resolved_base).mkdir(parents=True, exist_ok=True)
+
+    _save_config({"allowed_roots": resolved_roots, "base_dir": resolved_base})
+
+    ALLOWED_ROOTS = resolved_roots
+    DEFAULT_BASE_DIR = resolved_base
+
+    # Show top-level structure so Claude knows existing folders immediately
+    lines = [
+        f"✅ Vault configured!",
+        f"   Allowed roots: {', '.join(resolved_roots)}",
+        f"   Default save location: {resolved_base}",
+        f"   Config saved to: {CONFIG_PATH}",
+        f"",
+        f"📁 Your folder structure:",
+    ]
+    for root in resolved_roots:
+        root_path = Path(root)
+        try:
+            entries = sorted(root_path.iterdir())
+            dirs = [e for e in entries if e.is_dir()]
+            for d in dirs[:30]:
+                lines.append(f"  📂 {d.relative_to(root_path)}/")
+                # One level deeper
+                try:
+                    subdirs = sorted([s for s in d.iterdir() if s.is_dir()])
+                    for s in subdirs[:10]:
+                        lines.append(f"      📂 {s.relative_to(root_path)}/")
+                except PermissionError:
+                    pass
+        except PermissionError:
+            lines.append(f"  ⚠️ Permission denied: {root}")
+
+    lines.append(f"\nUse these exact paths when saving files.")
+    return "\n".join(lines)
+
+
+# ── Tool: find_folder ─────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def find_folder(name: str) -> str:
+    """
+    Find a folder by name (or partial name) across all allowed roots.
+    Use this instead of asking the user for a path — always call this first
+    when the user mentions a folder by name (e.g. 'distributed systems', 'job applications').
+
+    Args:
+        name: Folder name or partial name to search for (case-insensitive).
+    """
+    if not ALLOWED_ROOTS:
+        return SETUP_REQUIRED_MSG
+
+    needle = name.lower().replace(" ", "").replace("-", "").replace("_", "")
+    matches = []
+
+    for root in ALLOWED_ROOTS:
+        for dirpath in Path(root).rglob("*"):
+            if dirpath.is_dir():
+                normalized = dirpath.name.lower().replace(" ", "").replace("-", "").replace("_", "")
+                if needle in normalized:
+                    matches.append(str(dirpath))
+
+    if not matches:
+        return (
+            f"No folder matching '{name}' found in: {', '.join(ALLOWED_ROOTS)}\n"
+            f"You can create one with create_directory, or ask the user to confirm the folder name."
+        )
+
+    lines = [f"Found {len(matches)} match(es) for '{name}':"]
+    for m in matches[:10]:
+        lines.append(f"  {m}")
+    if len(matches) > 10:
+        lines.append(f"  … and {len(matches) - 10} more")
+    lines.append("\nUse the exact path above when saving files.")
+    return "\n".join(lines)
+
+
 # ── Tool: get_server_config ────────────────────────────────────────────────
 
 
 @mcp.tool()
 async def get_server_config() -> str:
     """
-    Show the current server configuration (base directory, limits, etc.).
+    Show the current vault configuration. Always call this first to check
+    if the vault is configured before using any other tool.
     """
+    if not ALLOWED_ROOTS:
+        return SETUP_REQUIRED_MSG
     return (
-        f"⚙️ MCP File Server Config\n"
-        f"  Base directory:   {DEFAULT_BASE_DIR}\n"
-        f"  Allowed roots:    {', '.join(ALLOWED_ROOTS)}\n"
-        f"  Max file size:    {MAX_FILE_SIZE_MB} MB\n"
-        f"  Blocked exts:     {', '.join(sorted(BLOCKED_EXTENSIONS))}\n"
+        f"⚙️ Vault Config\n"
+        f"  Default save location: {DEFAULT_BASE_DIR}\n"
+        f"  Allowed roots:         {', '.join(ALLOWED_ROOTS)}\n"
+        f"  Max file size:         {MAX_FILE_SIZE_MB} MB\n"
+        f"  Config file:           {CONFIG_PATH}\n"
     )
 
 
