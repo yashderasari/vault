@@ -27,6 +27,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
+import questionary
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
@@ -123,14 +124,19 @@ ALLOWED_ROOTS, DEFAULT_BASE_DIR = _init_roots()
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 
+_HOME = Path.home()
 SETUP_REQUIRED_MSG = (
     "⚠️ Vault isn't set up yet.\n\n"
+    f"The user's home directory is: {_HOME}\n\n"
     "Before I can save or manage any files, I need to know where you keep your stuff. "
     "Please ask the user:\n\n"
-    "\"Where would you like to save your files? You can:\n"
-    "  1. Point me to an existing folder (e.g. ~/Documents or ~/Desktop)\n"
-    "  2. Create a fresh ~/Documents/Vault folder just for AI-generated files\"\n\n"
-    "Once they answer, call the configure tool with their choice."
+    f"\"Where would you like to save your files? You can:\n"
+    f"  1. Point me to an existing folder (e.g. {_HOME}/Documents or {_HOME}/Desktop)\n"
+    f"  2. Create a fresh {_HOME}/Documents/Vault folder just for AI-generated files\"\n\n"
+    "Once they answer, call the configure tool with their choice. "
+    f"If they say 'Documents', use {_HOME}/Documents. "
+    f"If they say 'Desktop', use {_HOME}/Desktop. "
+    "Resolve ~ paths to their full absolute form before calling configure."
 )
 
 
@@ -163,13 +169,13 @@ def _resolve_path(target: str) -> Path:
 
 
 def _check_extension(filename: str):
-    """Block potentially dangerous file extensions."""
-    ext = Path(filename).suffix.lower()
-    if ext in BLOCKED_EXTENSIONS:
-        raise ValueError(
-            f"File extension '{ext}' is blocked for security reasons. "
-            f"Blocked: {', '.join(sorted(BLOCKED_EXTENSIONS))}"
-        )
+    """Block potentially dangerous file extensions (checks all suffixes)."""
+    for ext in [s.lower() for s in Path(filename).suffixes]:
+        if ext in BLOCKED_EXTENSIONS:
+            raise ValueError(
+                f"File extension '{ext}' is blocked for security reasons. "
+                f"Blocked: {', '.join(sorted(BLOCKED_EXTENSIONS))}"
+            )
 
 
 def _human_size(size_bytes: int) -> str:
@@ -250,6 +256,7 @@ async def download_file(
         url_path = parsed.path.rstrip("/")
         filename = os.path.basename(url_path) or "downloaded_file"
         filename = re.sub(r"[?#].*", "", filename)
+        filename = filename.replace("\x00", "")
 
     _check_extension(filename)
 
@@ -272,8 +279,30 @@ async def download_file(
 
     # Stream download
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-            async with client.stream("GET", url) as response:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=60) as client:
+            # Manually follow redirects, validating each hop
+            current_url = url
+            for _ in range(10):
+                response = await client.send(
+                    client.build_request("GET", current_url),
+                    stream=True,
+                )
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location", "")
+                    hop = urlparse(location)
+                    if hop.scheme not in ("http", "https"):
+                        return f"❌ Redirect to non-http(s) URL blocked: {location}"
+                    host = hop.hostname or ""
+                    _BLOCKED_HOSTS = ("169.254.", "10.", "192.168.", "172.", "127.", "::1", "localhost")
+                    if any(host.startswith(b) or host == b.rstrip(".") for b in _BLOCKED_HOSTS):
+                        return f"❌ Redirect to internal/private address blocked: {location}"
+                    await response.aclose()
+                    current_url = location
+                    continue
+                break
+            else:
+                return "❌ Too many redirects."
+            async with response:
                 response.raise_for_status()
 
                 # Check content-length
@@ -618,6 +647,8 @@ async def move_file(source: str, destination: str) -> str:
         return f"❌ {e}"
     logger.info('"moving %s to %s"', source, destination)
     src = Path(source).expanduser().resolve()
+    if not src.is_relative_to(Path.home()):
+        return f"❌ Source outside home directory is not permitted: {src}"
     try:
         dst = _resolve_path(destination)
     except ValueError as e:
@@ -667,6 +698,8 @@ async def copy_file(source: str, destination: str) -> str:
         return f"❌ {e}"
     logger.info('"copying %s to %s"', source, destination)
     src = Path(source).expanduser().resolve()
+    if not src.is_relative_to(Path.home()):
+        return f"❌ Source outside home directory is not permitted: {src}"
     try:
         dst = _resolve_path(destination)
     except ValueError as e:
@@ -780,6 +813,8 @@ async def configure(
     resolved_roots = []
     for p in allowed_roots:
         path = Path(p).expanduser().resolve()
+        if not path.is_relative_to(Path.home()):
+            return f"❌ Refusing root outside home directory: {path}"
         path.mkdir(parents=True, exist_ok=True)
         resolved_roots.append(str(path))
 
@@ -904,28 +939,152 @@ async def health(_request):
 # ─── Entrypoint ─────────────────────────────────────────────────────────────
 
 
+def _claude_config_path() -> Path:
+    """Return the Claude Desktop config file path for the current OS."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        return Path(appdata) / "Claude" / "claude_desktop_config.json"
+    else:
+        return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
+
+
+def _cmd_setup():
+    """Ask for a folder, write vault config, and register in Claude Desktop."""
+    home = Path.home()
+
+    named_options = {
+        f"Documents  ({home}/Documents)":  home / "Documents",
+        f"Desktop    ({home}/Desktop)":    home / "Desktop",
+        f"Downloads  ({home}/Downloads)":  home / "Downloads",
+        f"Home       ({home})":            home,
+    }
+    CUSTOM = "Custom path…"
+
+    selected = questionary.checkbox(
+        "Where should vault be allowed to save and manage files?",
+        choices=[
+            f"Documents  ({home}/Documents)",
+            f"Desktop    ({home}/Desktop)",
+            f"Downloads  ({home}/Downloads)",
+            f"Home       ({home})",
+            CUSTOM,
+        ],
+        instruction="(Use arrow keys to move, <space> to select, Enter to confirm)",
+        style=questionary.Style([
+            ("highlighted", "fg:green bold"),
+            ("selected", "fg:green"),
+            ("pointer", "fg:green bold"),
+        ]),
+    ).ask()
+
+    if selected is None:
+        print("Setup cancelled.")
+        sys.exit(0)
+
+    folders = []
+    for item in selected:
+        if item == CUSTOM:
+            raw = questionary.text("Enter custom path:").ask() or ""
+            folders.append(Path(raw).expanduser() if raw else home / "Documents")
+        else:
+            folders.append(named_options[item])
+
+    if not folders:
+        print("No folders selected, defaulting to Documents.")
+        folders = [home / "Documents"]
+
+    resolved = [str(f.resolve()) for f in folders]
+    for r in resolved:
+        Path(r).mkdir(parents=True, exist_ok=True)
+
+    vault_config_dir = home / ".vault-mcp"
+    vault_config_dir.mkdir(exist_ok=True)
+    (vault_config_dir / "config.json").write_text(
+        json.dumps({"allowed_roots": resolved, "base_dir": resolved[0]}, indent=2),
+        encoding="utf-8",
+    )
+    print(f"\n✅ Vault folders set to: {', '.join(resolved)}")
+
+    # Register in Claude Desktop config
+    config_path = _claude_config_path()
+
+    if not config_path.parent.exists():
+        print(f"\nClaude Desktop config directory not found: {config_path.parent}")
+        print("Make sure Claude Desktop is installed, then re-run 'uvx ai-vault-mcp setup'.")
+        sys.exit(1)
+
+    config: dict = {}
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            print(f"Could not parse {config_path} — please fix the JSON and re-run.")
+            sys.exit(1)
+
+    servers = config.setdefault("mcpServers", {})
+
+    if "vault" in servers:
+        print("✅ vault already registered in Claude Desktop config")
+    else:
+        servers["vault"] = {"command": "uvx", "args": ["ai-vault-mcp"]}
+        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        print("✅ vault added to Claude Desktop config")
+
+    print("\nRestart Claude Desktop and you're good to go.")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="MCP File Server")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="MCP File Server (ai-vault-mcp)")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("setup", help="Register vault in Claude Desktop's MCP config")
+
+    serve_parser = subparsers.add_parser("serve", help="Start the MCP server (default)")
+    serve_parser.add_argument(
         "--transport",
         choices=["stdio", "http"],
         default="stdio",
         help="Transport mode (default: stdio)",
     )
-    parser.add_argument(
+    serve_parser.add_argument(
         "--port",
         type=int,
         default=int(os.environ.get("PORT", "8000")),
         help="Port for HTTP transport (default: PORT env var or 8000)",
     )
-    parser.add_argument(
+    serve_parser.add_argument(
         "--host",
         default="127.0.0.1",
         help="Host for HTTP transport (default: 127.0.0.1)",
     )
+
+    # Keep top-level --transport/--port/--host for backwards compatibility
+    parser.add_argument("--transport", choices=["stdio", "http"], default="stdio")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    parser.add_argument("--host", default="127.0.0.1")
+
     args = parser.parse_args()
 
+    if args.command == "setup":
+        _cmd_setup()
+        return
+
     _ensure_base_dir()
+
+    if args.transport == "stdio" and sys.stdin.isatty():
+        print("vault MCP server")
+        print()
+        print("This process is meant to be launched by an MCP client (e.g. Claude Desktop),")
+        print("not run directly. To register vault with Claude Desktop, run:")
+        print()
+        print("  uvx ai-vault-mcp setup")
+        print()
+        print("To start the server over HTTP instead:")
+        print()
+        print("  uvx ai-vault-mcp --transport http")
+        sys.exit(0)
 
     if args.transport == "http":
         mcp.settings.host = args.host
